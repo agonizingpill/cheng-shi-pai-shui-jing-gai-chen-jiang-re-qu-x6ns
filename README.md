@@ -53,6 +53,46 @@ docker compose exec backend python -m scripts.seed_demo
 
 worker 使用固定参数 `DBSCAN(eps=26m, min_samples=3)` 对同一测量批次的二维投影坐标聚类。每个非噪声簇写入 `RepairZone`。局部密度评分为 `簇内点数 / 外接矩形面积 × 10,000`。坐标基准集合不为单一值时，后端以 `409 DATUM_CONFLICT` 拒绝聚类。算法输入、参数、结果摘要、失败状态和完成时间均写入 `AnalysisJob`。
 
+## 可靠任务与中断接管
+
+送算时把测点清单与 DBSCAN 尺度（eps/min_samples）快照进 `AnalysisJob.input_summary`，之后无论重跑多少次都以快照为准，保证「沿用送算时的测点和聚类尺度」。围绕该任务实现了完整的 at-least-once 运行时：
+
+| 风险 | 机制 | 落点 |
+|---|---|---|
+| 登记了但消息没进 Redis（没排上） | outbox 对账：worker 每 5 秒扫描久处 `queued` 的任务并重投；也可人工调 `POST /api/survey-batches/{id}/reconcile-jobs` | `services/job_runtime.py::reconcile_enqueued` |
+| 算到一半进程崩溃 | 租约（默认 20s）+ 收割：租约到期的 `running` 任务被原子收回 `queued` 并重新投递，API 启动时也会回收一次 | `reap_stale_jobs` |
+| 旧进程复活后结果覆盖接手方 | fencing token：每次认领/接管 token 递增，出片写回前行锁校验 token，过期写入被拒并记录 `stale_write_rejected` 事件 | `services/cluster.py`、`job_runtime.py` |
+| 出片回执丢失、前端重试 | 送算接口幂等：同批次存在 `queued/running/succeeded/failed` 任务时一律复用同一 job，不新增任务；成功后直接回原片区编号 | `main.py::enqueue_cluster` |
+| 重试后查不到原片区 | 片区编号由批次码+簇号确定性生成（`RZ-1121-AM-01`），重跑删旧建新后编号不变 | `services/job_rules.py::deterministic_zone_code` |
+
+任务全过程事件写入 `analysis_job_events`（入队、认领、收回、重投、完成、拦截），`GET /api/analysis-jobs/{id}` 返回完整时间线；测绘图板下方的「任务可靠性追踪」面板可看到任务何时被接手、尝试次数、当前 worker、fencing token 以及最后出片的热区编号。
+
+### 故障演练剧本
+
+```bash
+# 场景 A：算到一半进程崩溃，租约到期后自动接手
+# 1. 前端送算，从仪表盘 jobs[0].id 拿到任务 id（通常为 1）
+# 2. 让 worker 认领即崩
+CRASH_AFTER_CLAIM_JOB_ID=1 docker compose up -d --force-recreate worker
+# 3. 一个租约周期（默认 20s）后任务被收回并重新接手；
+#    测绘页时间线出现 requeued → claimed → succeeded，attempts=2，热区编号不变
+
+# 场景 B：旧进程复活后迟到写回，被 fencing 拦截
+# 1. 起一个会「持旧租约睡过接管窗口」的 worker
+HANG_AFTER_CLAIM_JOB_ID=1 docker compose up -d --force-recreate worker
+# 2. 再扩容一个正常 worker 负责接手
+docker compose up -d --scale worker=2 --no-recreate worker
+# 3. 接管方先出片；旧 worker 醒来用旧 token 写回，时间线出现
+#    stale_write_rejected，接手方热区不被覆盖
+```
+
+离线纯规则测试（无需数据库与三方依赖）：
+
+```bash
+python3 backend/tests/test_job_rules.py   # 20 项幂等/fencing/租约/编号规则
+python3 backend/tests/static_check.py     # 全量编译与跨模块导入符号校验
+```
+
 ## 技术栈与目录
 
 | 层 | 技术 |

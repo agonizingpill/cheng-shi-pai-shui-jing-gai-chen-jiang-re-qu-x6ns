@@ -10,6 +10,7 @@ export const auth=async(username,password)=>api('/auth/login',{method:'POST',bod
 export const loadDashboard=()=>api('/dashboard');
 export const correctDatum=id=>api(`/survey-points/${id}/correct-datum`,{method:'POST'});
 export const cluster=id=>api(`/survey-batches/${id}/cluster`,{method:'POST'});
+export const reconcileJobs=id=>api(`/survey-batches/${id}/reconcile-jobs`,{method:'POST'});
 export const job=id=>api(`/analysis-jobs/${id}`);
 export const splitZone=id=>api(`/zones/${id}/split`,{method:'POST'});
 export const createNotice=(id,payload)=>api(`/zones/${id}/work-notices`,{method:'POST',body:JSON.stringify(payload)});

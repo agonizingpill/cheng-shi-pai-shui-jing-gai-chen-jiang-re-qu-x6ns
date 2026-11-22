@@ -7,13 +7,15 @@ from sqlalchemy.orm import Session
 from redis import Redis
 
 from .operations_evidence import router as operations_evidence
-from .database import Base, SessionLocal, engine, get_db
+from .database import SessionLocal, get_db
 from .models import AnalysisJob, AuditLog, ManholeAsset, RepairZone, Resurvey, SurveyBatch, SurveyPoint, User, WorkNotice
 from .schemas import BatchIn, LoginIn, NoticeIn, ResurveyIn, SurveyPointIn
 from .security import create_token, current_user, require_roles, verify_password
 from .services.audit import record
-from .services.cluster import build_input
+from .services.cluster import EPS_METERS, MIN_SAMPLES, build_input
 from .services.geometry import bounds, overlaps
+from .services.job_runtime import JOB_QUEUE_KEY, add_event, reap_stale_jobs
+from .schema_bootstrap import ensure_schema
 from .middlewares.audit import RequestAuditMiddleware
 from .middlewares.rate_limit import SimpleRateLimitMiddleware
 
@@ -28,7 +30,15 @@ redis_client = Redis.from_url(os.getenv("REDIS_URL", "redis://redis:6379/0"), de
 
 @app.on_event("startup")
 def startup():
-    Base.metadata.create_all(engine)
+    ensure_schema()
+    # 服务恢复：上次宕机时停在 running 的任务，租约已无人续租，统一收回队列
+    db = SessionLocal()
+    try:
+        reaped = reap_stale_jobs(db, "api-startup")
+        for job_id in reaped:
+            redis_client.rpush(JOB_QUEUE_KEY, str(job_id))
+    finally:
+        db.close()
     if os.getenv("SEED_DEMO", "true").lower() == "true":
         try:
             from scripts.seed_demo import seed
@@ -55,13 +65,22 @@ def point_view(p):
 def zone_view(z, db):
     notice = db.get(WorkNotice, z.conflict_notice_id) if z.conflict_notice_id else None
     point_rows = db.execute(select(SurveyPoint).where(SurveyPoint.id.in_(z.point_ids or []))).scalars().all() if z.point_ids else []
-    return {"id": z.id, "zone_code": z.zone_code, "batch_id": z.batch_id, "cluster_label": z.cluster_label, "name": z.name, "status": z.status, "point_ids": z.point_ids or [], "point_codes": [p.point_code for p in point_rows], "center_x": z.center_x, "center_y": z.center_y, "average_settlement_mm": z.average_settlement_mm, "max_settlement_mm": z.max_settlement_mm, "local_density": z.local_density, "boundary": z.boundary, "original_cluster_evidence": z.original_cluster_evidence, "split_from_id": z.split_from_id, "conflict_notice_id": z.conflict_notice_id, "split_reason": z.split_reason, "conflict_road": notice.road_name if notice else None}
+    return {"id": z.id, "zone_code": z.zone_code, "batch_id": z.batch_id, "cluster_label": z.cluster_label, "name": z.name, "status": z.status, "point_ids": z.point_ids or [], "point_codes": [p.point_code for p in point_rows], "center_x": z.center_x, "center_y": z.center_y, "average_settlement_mm": z.average_settlement_mm, "max_settlement_mm": z.max_settlement_mm, "local_density": z.local_density, "boundary": z.boundary, "original_cluster_evidence": z.original_cluster_evidence, "source_job_code": (z.original_cluster_evidence or {}).get("job_code"), "split_from_id": z.split_from_id, "conflict_notice_id": z.conflict_notice_id, "split_reason": z.split_reason, "conflict_road": notice.road_name if notice else None}
 
 def notice_view(n):
     return {"id": n.id, "notice_code": n.notice_code, "zone_id": n.zone_id, "road_name": n.road_name, "contractor": n.contractor, "permit_no": n.permit_no, "starts_at": iso(n.starts_at), "ends_at": iso(n.ends_at), "boundary": n.boundary, "status": n.status, "lane_closure_required": n.lane_closure_required, "conflict_note": n.conflict_note}
 
 def resurvey_view(r):
     return {"id": r.id, "record_code": r.record_code, "zone_id": r.zone_id, "measured_at": iso(r.measured_at), "settlement_before_mm": r.settlement_before_mm, "settlement_after_mm": r.settlement_after_mm, "delta_mm": r.delta_mm, "pass_fail": r.pass_fail, "status": r.status, "verified_by": r.verified_by, "notes": r.notes}
+
+def job_event_view(e):
+    return {"id": e.id, "event_type": e.event_type, "worker_id": e.worker_id, "detail": e.detail, "created_at": iso(e.created_at)}
+
+def job_view(j, include_events=False):
+    data = {"id": j.id, "job_code": j.job_code, "batch_id": j.batch_id, "status": j.status, "result": j.result, "error": j.error, "attempts": j.attempts, "worker_id": j.worker_id, "lease_expires_at": iso(j.lease_expires_at), "fencing_token": j.fencing_token, "enqueued_at": iso(j.enqueued_at), "started_at": iso(j.started_at), "created_at": iso(j.created_at), "finished_at": iso(j.finished_at), "params": (j.input_summary or {}).get("params", {}), "point_count": len((j.input_summary or {}).get("points", []))}
+    if include_events:
+        data["events"] = [job_event_view(e) for e in j.events]
+    return data
 
 @app.post("/api/auth/login")
 def login(payload: LoginIn, db: Session = Depends(get_db)):
@@ -83,7 +102,7 @@ def dashboard(db: Session = Depends(get_db), user: User = Depends(current_user))
     notices = db.execute(select(WorkNotice).order_by(WorkNotice.id)).scalars().all()
     resurveys = db.execute(select(Resurvey).order_by(Resurvey.id.desc())).scalars().all()
     jobs = db.execute(select(AnalysisJob).order_by(AnalysisJob.id.desc())).scalars().all()
-    return {"user": user_view(user), "stats": {"assets": len(assets), "points": len(points), "zones": len(zones), "open_zones": sum(z.status not in ["closed", "split"] for z in zones), "notices": len(notices), "resurveys": len(resurveys)}, "batches": [{"id": b.id, "batch_code": b.batch_code, "measured_at": iso(b.measured_at), "instrument": b.instrument, "coordinate_reference": b.coordinate_reference, "status": b.status, "notes": b.notes, "point_count": len(b.points)} for b in batches], "assets": [asset_view(a) for a in assets], "points": [point_view(p) for p in points], "zones": [zone_view(z, db) for z in zones], "notices": [notice_view(n) for n in notices], "resurveys": [resurvey_view(r) for r in resurveys], "jobs": [{"id": j.id, "job_code": j.job_code, "batch_id": j.batch_id, "status": j.status, "result": j.result, "error": j.error, "finished_at": iso(j.finished_at)} for j in jobs]}
+    return {"user": user_view(user), "stats": {"assets": len(assets), "points": len(points), "zones": len(zones), "open_zones": sum(z.status not in ["closed", "split"] for z in zones), "notices": len(notices), "resurveys": len(resurveys)}, "batches": [{"id": b.id, "batch_code": b.batch_code, "measured_at": iso(b.measured_at), "instrument": b.instrument, "coordinate_reference": b.coordinate_reference, "status": b.status, "notes": b.notes, "point_count": len(b.points)} for b in batches], "assets": [asset_view(a) for a in assets], "points": [point_view(p) for p in points], "zones": [zone_view(z, db) for z in zones], "notices": [notice_view(n) for n in notices], "resurveys": [resurvey_view(r) for r in resurveys], "jobs": [job_view(j) for j in jobs]}
 
 @app.get("/api/survey-batches/{batch_id}")
 def batch_detail(batch_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):
@@ -138,16 +157,78 @@ def enqueue_cluster(batch_id: int, db: Session = Depends(get_db), user: User = D
         db.commit()
         conflicts = [p["point_code"] for p in points if p["coordinate_reference"] != batch.coordinate_reference]
         raise HTTPException(status_code=409, detail={"code": "DATUM_CONFLICT", "message": "测量点存在坐标基准冲突，禁止聚类", "point_codes": conflicts, "batch_status": batch.status})
-    job = AnalysisJob(job_code=f"JOB-{batch.batch_code}-{int(datetime.now().timestamp())}", batch_id=batch.id, status="queued", input_summary={"points": points, "params": {"eps_m": 26.0, "min_samples": 3}})
-    batch.status = "queued"; db.add(job); record(db, user.id, "enqueue_spatial_cluster", "AnalysisJob", job.job_code, {"batch_code": batch.batch_code, "point_count": len(points)}); db.commit(); db.refresh(job)
-    redis_client.rpush("manhole_settlement_jobs", str(job.id))
-    return {"job_id": job.id, "job_code": job.job_code, "status": job.status}
+
+    now = datetime.now(timezone.utc)
+    latest = db.execute(
+        select(AnalysisJob).where(AnalysisJob.batch_id == batch.id).order_by(AnalysisJob.id.desc())
+    ).scalars().first()
+
+    # —— 幂等：回执丢失后的重试不新增任务，始终返回同一个 job ——
+    if latest and latest.status in ("queued", "running"):
+        # 消息可能在 rpush 前丢失：再投一次是安全的，claim 端会幂等吞重
+        redis_client.rpush(JOB_QUEUE_KEY, str(latest.id))
+        add_event(db, latest, "enqueue_retry", detail={"by": user.username, "reason": "ack_missing_or_pending"})
+        record(db, user.id, "reuse_spatial_cluster_job", "AnalysisJob", latest.job_code, {"batch_code": batch.batch_code, "status": latest.status})
+        db.commit()
+        return {"job_id": latest.id, "job_code": latest.job_code, "status": latest.status, "reused": True}
+
+    if latest and latest.status == "succeeded":
+        # 已出片：直接回原片区编号，不再起新任务
+        record(db, user.id, "reuse_spatial_cluster_job", "AnalysisJob", latest.job_code, {"batch_code": batch.batch_code, "status": "succeeded"})
+        db.commit()
+        return {"job_id": latest.id, "job_code": latest.job_code, "status": latest.status, "reused": True, "zone_codes": (latest.result or {}).get("zone_codes", [])}
+
+    if latest and latest.status == "failed":
+        # 同一任务重试：沿用送算时锁定的测点快照与聚类尺度，不新建 job
+        latest.status = "queued"
+        latest.worker_id = None
+        latest.lease_expires_at = None
+        latest.error = None
+        latest.finished_at = None
+        latest.fencing_token += 1
+        latest.enqueued_at = now
+        add_event(db, latest, "requeued", detail={"reason": "manual_retry", "by": user.username, "next_fencing_token": latest.fencing_token})
+        record(db, user.id, "retry_spatial_cluster_job", "AnalysisJob", latest.job_code, {"batch_code": batch.batch_code})
+        db.commit()
+        redis_client.rpush(JOB_QUEUE_KEY, str(latest.id))
+        return {"job_id": latest.id, "job_code": latest.job_code, "status": latest.status, "reused": True}
+
+    # 首次送算：测点与参数在此刻快照，之后重跑全部以快照为准
+    job = AnalysisJob(
+        job_code=f"JOB-{batch.batch_code}-{int(now.timestamp())}",
+        batch_id=batch.id, status="queued",
+        input_summary={"points": points, "params": {"eps_m": EPS_METERS, "min_samples": MIN_SAMPLES}},
+        enqueued_at=now,
+    )
+    batch.status = "queued"
+    db.add(job); db.flush()
+    add_event(db, job, "enqueued", detail={"point_count": len(points), "eps_m": EPS_METERS, "min_samples": MIN_SAMPLES})
+    record(db, user.id, "enqueue_spatial_cluster", "AnalysisJob", job.job_code, {"batch_code": batch.batch_code, "point_count": len(points)})
+    db.commit(); db.refresh(job)
+    redis_client.rpush(JOB_QUEUE_KEY, str(job.id))
+    return {"job_id": job.id, "job_code": job.job_code, "status": job.status, "reused": False}
 
 @app.get("/api/analysis-jobs/{job_id}")
 def job_detail(job_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):
     job = db.get(AnalysisJob, job_id)
     if not job: raise HTTPException(404, "分析任务不存在")
-    return {"id": job.id, "job_code": job.job_code, "status": job.status, "result": job.result, "error": job.error, "finished_at": iso(job.finished_at)}
+    return job_view(job, include_events=True)
+
+@app.post("/api/survey-batches/{batch_id}/reconcile-jobs")
+def reconcile_batch_jobs(batch_id: int, db: Session = Depends(get_db), user: User = Depends(require_roles("operator", "supervisor"))):
+    """手动 outbox 对账：把批次下卡在 queued 的任务重新投递，不新增任务。"""
+    batch = db.get(SurveyBatch, batch_id)
+    if not batch:
+        raise HTTPException(404, "测量批次不存在")
+    jobs = db.execute(select(AnalysisJob).where(AnalysisJob.batch_id == batch.id, AnalysisJob.status.in_(["queued", "running"])).order_by(AnalysisJob.id)).scalars().all()
+    repushed = []
+    for j in jobs:
+        redis_client.rpush(JOB_QUEUE_KEY, str(j.id))
+        add_event(db, j, "manual_repush", detail={"by": user.username})
+        repushed.append(j.job_code)
+    record(db, user.id, "manual_reconcile_jobs", "SurveyBatch", batch.batch_code, {"jobs": repushed})
+    db.commit()
+    return {"batch_code": batch.batch_code, "repushed": repushed}
 
 @app.get("/api/zones")
 def zones(db: Session = Depends(get_db), user: User = Depends(current_user)):

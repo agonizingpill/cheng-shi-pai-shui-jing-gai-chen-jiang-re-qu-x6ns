@@ -52,12 +52,17 @@ services:
       retries: 30
   worker:
     build: ./backend
-    container_name: ${COMPOSE_PROJECT_NAME:-manhole-settlement}-worker
+    # 不固定 container_name，允许 --scale worker=N 扩容出多个接手进程
     command: ["python", "-m", "src.worker"]
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://municipal_ops:municipal_ops_local@db:5432/municipal_ops}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       SHARED_DIR: /shared
+      # 故障注入（默认空=关闭）。填 analysis_jobs.id 复现中断接管：
+      # CRASH_AFTER_CLAIM_JOB_ID 认领后进程退出；HANG_AFTER_CLAIM_JOB_ID 认领后持租约挂起
+      CRASH_AFTER_CLAIM_JOB_ID: ${CRASH_AFTER_CLAIM_JOB_ID:-}
+      HANG_AFTER_CLAIM_JOB_ID: ${HANG_AFTER_CLAIM_JOB_ID:-}
+      JOB_LEASE_SECONDS: ${JOB_LEASE_SECONDS:-20}
     volumes:
       - manhole_settlement_shared:/shared
     depends_on:

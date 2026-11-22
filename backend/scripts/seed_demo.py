@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 from src.database import Base, SessionLocal, engine
 from src.models import User, ManholeAsset, SurveyBatch, SurveyPoint, WorkNotice
+from src.schema_bootstrap import ensure_schema
 from src.security import hash_password
 
 def dt(day, hour, minute=0):
@@ -14,7 +15,7 @@ def get_or_create(db, model, where, values):
     row = model(**where, **values); db.add(row); db.flush(); return row, True
 
 def seed():
-    Base.metadata.create_all(engine)
+    ensure_schema()
     db = SessionLocal()
     try:
         for username, display, password, role in [

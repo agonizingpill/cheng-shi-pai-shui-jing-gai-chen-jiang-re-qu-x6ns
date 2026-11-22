@@ -114,8 +114,27 @@ class AnalysisJob(Base):
     input_summary = Column(JSON, nullable=False, default=dict)
     result = Column(JSON, nullable=True)
     error = Column(Text, nullable=True)
+    # —— 可靠任务：认领、租约与 fencing ——
+    worker_id = Column(String(80), nullable=True)
+    lease_expires_at = Column(DateTime(timezone=True), nullable=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    fencing_token = Column(Integer, nullable=False, default=0)
+    enqueued_at = Column(DateTime(timezone=True), nullable=True)
+    started_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
     finished_at = Column(DateTime(timezone=True), nullable=True)
+    events = relationship("AnalysisJobEvent", back_populates="job", cascade="all, delete-orphan", order_by="AnalysisJobEvent.id")
+
+class AnalysisJobEvent(Base):
+    """任务生命周期事件：入队、认领、租约超时接管、完成、过期写入拦截等。"""
+    __tablename__ = "analysis_job_events"
+    id = Column(Integer, primary_key=True)
+    job_id = Column(Integer, ForeignKey("analysis_jobs.id"), nullable=False, index=True)
+    event_type = Column(String(40), nullable=False)
+    worker_id = Column(String(80), nullable=True)
+    detail = Column(JSON, nullable=False, default=dict)
+    created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+    job = relationship("AnalysisJob", back_populates="events")
 
 class AuditLog(Base):
     __tablename__ = "audit_logs"
